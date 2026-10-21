@@ -4,6 +4,11 @@ defmodule Cholla.Application do
 
   @impl true
   def start(_type, _args) do
-    Supervisor.start_link([Cholla.Engine], strategy: :one_for_one, name: Cholla.Supervisor)
+    pools =
+      for {name, opts} <- Application.get_env(:cholla, :pools, default: []),
+          do: {Cholla.Pool, Keyword.put(opts, :name, name)}
+
+    children = [{Registry, keys: :unique, name: Cholla.Registry} | pools]
+    Supervisor.start_link(children, strategy: :one_for_one, name: Cholla.Supervisor)
   end
 end

@@ -2,10 +2,11 @@ defmodule Cholla.NIF do
   @moduledoc """
   Raw bindings to the Needle C API (`needle.h`).
 
-  Every function here maps one-to-one onto an engine call. The engine holds a
-  single process-global model per kind, so prefer the serialised API in
-  `Cholla` and `Cholla.Speech`; calling these directly from several processes
-  is memory-safe (the NIF holds a mutex) but interleaves conversation state.
+  Every function here maps one-to-one onto an engine call on an instance
+  opened with `open_engine/3`. An instance holds one model per kind and one
+  conversation, so prefer the pooled API in `Cholla` and `Cholla.Speech`;
+  calling these directly from several processes is memory-safe (each instance
+  has a mutex) but interleaves conversation state.
 
   Conventions:
 
@@ -33,56 +34,75 @@ defmodule Cholla.NIF do
     :erlang.load_nif(path, 0)
   end
 
-  @doc "dlopens the engine shared library. Only one engine can be open per VM."
-  @spec open_engine(Path.t()) :: :ok | {:error, {:already_open, binary()} | binary()}
-  def open_engine(_path), do: :erlang.nif_error(:nif_not_loaded)
+  @typedoc "An engine instance: a private copy of the engine library with its own state."
+  @type instance :: reference()
 
-  @doc "Path of the open engine, or `nil`."
-  @spec engine_path() :: {:ok, binary()} | nil
-  def engine_path, do: :erlang.nif_error(:nif_not_loaded)
+  @doc """
+  Opens an engine instance from the library at `path`. Each instance dlopens
+  its own copy of the library, so instances share no state.
 
-  @doc "`needle_load`: loads a `.cact` archive. Returns the `models/0` mask."
-  @spec load(binary()) :: {:ok, non_neg_integer()} | {:error, term()}
-  def load(_cact), do: :erlang.nif_error(:nif_not_loaded)
+  `threads` sizes the instance's thread pool, counting the calling thread
+  (0 keeps the engine's default of every core); `cpus` restricts it to the
+  given CPU numbers, or is `nil`. Both apply on Linux only.
+  """
+  @spec open_engine(Path.t(), non_neg_integer(), [non_neg_integer()] | nil) ::
+          {:ok, instance()} | {:error, binary()}
+  def open_engine(_path, _threads, _cpus), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  The instance's library path, `:threads` (`nil` for the default), `:cpus`,
+  whether `:thread_control` is supported, and the VM-wide `:vm_threads` and
+  `:instances` totals.
+  """
+  @spec info(instance()) :: map()
+  def info(_instance), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "`needle_load`: loads a `.cact` archive. Returns the `models/1` mask."
+  @spec load(instance(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def load(_instance, _cact), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "`needle_models`: `NEEDLE_TEXT` and/or `NEEDLE_SPEECH` bits."
-  @spec models() :: non_neg_integer()
-  def models, do: :erlang.nif_error(:nif_not_loaded)
+  @spec models(instance()) :: non_neg_integer()
+  def models(_instance), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "`needle_init`: sets the system prompt and tools; returns the static prefix token count."
-  @spec init(iodata(), iodata(), iodata() | nil) :: {:ok, non_neg_integer()} | {:error, term()}
-  def init(_system, _tools_json, _tool_index_path), do: :erlang.nif_error(:nif_not_loaded)
+  @spec init(instance(), iodata(), iodata(), iodata() | nil) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def init(_instance, _system, _tools_json, _tool_index_path),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "`needle_complete`: exactly one of `text` and `pcm` is non-nil. Returns the JSON envelope."
-  @spec complete(iodata() | nil, binary() | nil, pos_integer(), pos_integer()) ::
+  @spec complete(instance(), iodata() | nil, binary() | nil, pos_integer(), pos_integer()) ::
           {:ok, binary()} | {:error, term()}
-  def complete(_text, _pcm, _max_new_tokens, _capacity), do: :erlang.nif_error(:nif_not_loaded)
+  def complete(_instance, _text, _pcm, _max_new_tokens, _capacity),
+    do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "`needle_set_audio`: transcription settings used by `complete/4` with PCM."
-  @spec set_audio(iodata() | nil, iodata() | nil, boolean()) :: :ok | {:error, term()}
-  def set_audio(_language, _keywords, _word_timestamps), do: :erlang.nif_error(:nif_not_loaded)
+  @doc "`needle_set_audio`: transcription settings used by `complete/5` with PCM."
+  @spec set_audio(instance(), iodata() | nil, iodata() | nil, boolean()) :: :ok
+  def set_audio(_instance, _language, _keywords, _word_timestamps),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "`needle_reset`: clears the conversation."
-  @spec reset() :: :ok | {:error, term()}
-  def reset, do: :erlang.nif_error(:nif_not_loaded)
+  @spec reset(instance()) :: :ok
+  def reset(_instance), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "`needle_transcribe`: returns the JSON transcript."
-  @spec transcribe(binary(), iodata() | nil, iodata() | nil, boolean(), pos_integer()) ::
+  @spec transcribe(instance(), binary(), iodata() | nil, iodata() | nil, boolean(), pos_integer()) ::
           {:ok, binary()} | {:error, term()}
-  def transcribe(_pcm, _language, _keywords, _word_timestamps, _capacity),
+  def transcribe(_instance, _pcm, _language, _keywords, _word_timestamps, _capacity),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "`needle_stream_transcribe_process`: feeds live audio; returns committed words as JSON."
-  @spec stream_process(binary(), iodata() | nil, iodata() | nil, pos_integer()) ::
+  @spec stream_process(instance(), binary(), iodata() | nil, iodata() | nil, pos_integer()) ::
           {:ok, binary()} | {:error, term()}
-  def stream_process(_pcm, _language, _keywords, _capacity),
+  def stream_process(_instance, _pcm, _language, _keywords, _capacity),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "`needle_stream_transcribe_stop`: ends the live stream; returns the tail as JSON."
-  @spec stream_stop(pos_integer()) :: {:ok, binary()} | {:error, term()}
-  def stream_stop(_capacity), do: :erlang.nif_error(:nif_not_loaded)
+  @spec stream_stop(instance(), pos_integer()) :: {:ok, binary()} | {:error, term()}
+  def stream_stop(_instance, _capacity), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "`needle_embed`: exactly one of `text` and `pcm` is non-nil. Returns native f32 floats."
-  @spec embed(iodata() | nil, binary() | nil) :: {:ok, binary()} | {:error, term()}
-  def embed(_text, _pcm), do: :erlang.nif_error(:nif_not_loaded)
+  @spec embed(instance(), iodata() | nil, binary() | nil) :: {:ok, binary()} | {:error, term()}
+  def embed(_instance, _text, _pcm), do: :erlang.nif_error(:nif_not_loaded)
 end

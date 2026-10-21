@@ -7,9 +7,14 @@ defmodule Cholla.Speech do
   Audio is 16 kHz mono PCM as a binary of native-endian 32-bit floats in
   [-1, 1]. Build it with `from_floats/1` or `read_wav/1`. To answer spoken
   queries with an agent, pass `{:pcm, audio}` to `Cholla.complete/3`.
+
+  Calls run on the speech pool (`config :cholla, speech_pool: name`, else
+  the default pool) or the one given as `pool:`. Transcription and
+  embeddings go to the least busy instance; a live stream stays on the
+  instance chosen for the calling process. See `Cholla.Pool`.
   """
 
-  alias Cholla.{Engine, NIF}
+  alias Cholla.{Engine, NIF, Pool}
 
   @sample_rate 16_000
   @capacity 262_144
@@ -30,11 +35,13 @@ defmodule Cholla.Speech do
       detected when omitted
     * `:keywords` - a list of words or phrases to bias recognition towards
     * `:word_timestamps` - include word timings (default `false`)
+    * `:pool` - the `Cholla.Pool` to run on (all functions here take it)
   """
   @spec transcribe(binary(), keyword()) :: {:ok, map()} | {:error, term()}
   def transcribe(pcm, opts \\ []) when is_binary(pcm) do
-    with_speech(fn ->
+    with_speech(opts, nil, fn instance ->
       NIF.transcribe(
+        instance,
         pcm,
         opts[:language],
         keywords(opts[:keywords]),
@@ -48,31 +55,33 @@ defmodule Cholla.Speech do
   Feeds about a second of live audio to the stream transcriber.
 
   Returns the words committed by this call (two consecutive passes agree on
-  them) and the unconfirmed `"pending"` tail. The engine holds one stream per
-  VM, so keep a stream within one process, for example inside
-  `Cholla.Engine.transaction/1`.
+  them) and the unconfirmed `"pending"` tail. An instance holds one stream,
+  and calls from one process go to the same instance, so keep a stream
+  within one process. Use `stream/2`, or `Cholla.Pool.transaction/3`, to
+  keep other processes from feeding the same instance meanwhile.
 
   Takes the `:language` and `:keywords` options of `transcribe/2`.
   """
   @spec feed(binary(), keyword()) :: {:ok, map()} | {:error, term()}
   def feed(pcm, opts \\ []) when is_binary(pcm) do
-    with_speech(fn ->
-      NIF.stream_process(pcm, opts[:language], keywords(opts[:keywords]), @capacity)
+    with_speech(opts, self(), fn instance ->
+      NIF.stream_process(instance, pcm, opts[:language], keywords(opts[:keywords]), @capacity)
     end)
   end
 
   @doc "Ends the live stream, committing its tail. The next `feed/2` starts a new stream."
-  @spec stop() :: {:ok, map()} | {:error, term()}
-  def stop, do: with_speech(fn -> NIF.stream_stop(@capacity) end)
+  @spec stop(keyword()) :: {:ok, map()} | {:error, term()}
+  def stop(opts \\ []),
+    do: with_speech(opts, self(), fn instance -> NIF.stream_stop(instance, @capacity) end)
 
   @doc """
   Transcribes an enumerable of PCM chunks as a live stream and returns every
-  committed word, ending the stream at the end. Holds the engine for the
+  committed word, ending the stream at the end. Holds one instance for the
   duration.
   """
   @spec stream(Enumerable.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def stream(chunks, opts \\ []) do
-    Engine.transaction(fn ->
+    Pool.transaction(speech_pool(opts), self(), fn ->
       result =
         Enum.reduce_while(chunks, {:ok, []}, fn chunk, {:ok, acc} ->
           case feed(chunk, opts) do
@@ -81,7 +90,7 @@ defmodule Cholla.Speech do
           end
         end)
 
-      with {:ok, parts} <- result, {:ok, tail} <- stop() do
+      with {:ok, parts} <- result, {:ok, tail} <- stop(opts) do
         parts = Enum.reverse([tail | parts])
         words = Enum.flat_map(parts, &(&1["words"] || []))
 
@@ -91,7 +100,7 @@ defmodule Cholla.Speech do
         {:ok, %{"text" => text, "words" => words, "parts" => parts}}
       else
         error ->
-          stop()
+          stop(opts)
           error
       end
     end)
@@ -104,10 +113,13 @@ defmodule Cholla.Speech do
   """
   @spec embed(binary(), keyword()) :: {:ok, [float()] | binary()} | {:error, term()}
   def embed(pcm, opts \\ []) when is_binary(pcm) do
-    Engine.op(fn state ->
+    Pool.op(speech_pool(opts), nil, fn state ->
       case Engine.ensure_speech(state) do
-        {:ok, state} -> {NIF.embed(nil, pcm) |> embedding(pcm, opts[:format]), state}
-        error -> Engine.reply(error)
+        {:ok, state} ->
+          {NIF.embed(state.instance, nil, pcm) |> embedding(pcm, opts[:format]), state}
+
+        error ->
+          Engine.reply(error)
       end
     end)
   end
@@ -128,10 +140,12 @@ defmodule Cholla.Speech do
 
   defp embedding(result, _pcm, format), do: Cholla.format_floats(result, format)
 
-  defp with_speech(fun) do
-    Engine.op(fn state ->
+  defp speech_pool(opts), do: opts[:pool] || Pool.speech_default()
+
+  defp with_speech(opts, key, fun) do
+    Pool.op(speech_pool(opts), key, fn state ->
       case Engine.ensure_speech(state) do
-        {:ok, state} -> {decode(fun.()), state}
+        {:ok, state} -> {decode(fun.(state.instance)), state}
         error -> Engine.reply(error)
       end
     end)
