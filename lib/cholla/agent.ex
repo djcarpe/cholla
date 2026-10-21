@@ -75,7 +75,7 @@ defmodule Cholla.Agent do
       id: make_ref(),
       system: system,
       tools: schemas,
-      tools_json: JSON.encode!(schemas),
+      tools_json: Tool.encode_json(schemas),
       functions: functions,
       tool_index_path: opts[:tool_index_path] && Path.expand(opts[:tool_index_path]),
       weights: opts[:weights] && Path.expand(opts[:weights]),

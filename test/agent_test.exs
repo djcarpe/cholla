@@ -24,6 +24,12 @@ defmodule Cholla.AgentTest do
     assert agent.system == ""
     assert agent.functions == %{"t" => fun}
     assert [%{"name" => "t"}, %{"name" => "raw"}] = JSON.decode!(agent.tools_json)
+
+    # the model's key order, not Elixir's sorted map keys
+    assert agent.tools_json ==
+             ~s([{"name":"t","parameters":{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}},) <>
+               ~s({"name":"raw","parameters":{}}])
+
     refute Agent.new().id == Agent.new().id
   end
 end

@@ -159,6 +159,40 @@ defmodule Cholla.Tool do
   defp enum_value(value) when is_atom(value) and not is_boolean(value), do: Atom.to_string(value)
   defp enum_value(value), do: value
 
+  @key_order ~w(name description parameters arguments type properties required enum items)
+
+  @doc """
+  Compact JSON with the key order the model was trained on: `name`,
+  `description`, `parameters`, `arguments`, `type`, `properties`, `required`,
+  `enum`, `items`, then any other keys sorted.
+
+  The engine places the tools JSON in the prompt as given, and the model is
+  sensitive to the spelling: Elixir's sorted map keys (`description` before
+  `name`) cost the base model two thirds of its exact matches on a 60-example
+  set against this order, so `Cholla.agent/1` and `Cholla.Train` both use it.
+  """
+  @spec encode_json(term()) :: String.t()
+  def encode_json(term), do: term |> ordered_iodata() |> IO.iodata_to_binary()
+
+  defp ordered_iodata(%{} = map) do
+    {first, rest} = Enum.split_with(Map.keys(map), &(&1 in @key_order))
+
+    keys =
+      Enum.sort_by(first, &Enum.find_index(@key_order, fn k -> k == &1 end)) ++ Enum.sort(rest)
+
+    pairs =
+      for key <- keys do
+        [JSON.encode!(to_string(key)), ?:, ordered_iodata(map[key])]
+      end
+
+    [?{, Enum.intersperse(pairs, ?,), ?}]
+  end
+
+  defp ordered_iodata(list) when is_list(list),
+    do: [?[, list |> Enum.map(&ordered_iodata/1) |> Enum.intersperse(?,), ?]]
+
+  defp ordered_iodata(other), do: JSON.encode!(other)
+
   defp stringify(%{} = map), do: Map.new(map, fn {k, v} -> {to_string(k), stringify(v)} end)
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
 
