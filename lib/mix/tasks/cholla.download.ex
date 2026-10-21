@@ -4,20 +4,26 @@ defmodule Mix.Tasks.Cholla.Download do
   Downloads the Needle engine library and base weights ahead of time, so the
   first query does not wait on the network.
 
-      mix cholla.download            # engine + needle3.cact
-      mix cholla.download --speech   # also whistle.cact
+      mix cholla.download               # engine + needle3.cact
+      mix cholla.download --speech      # also whistle.cact
+      mix cholla.download --checkpoint  # also needle3.safetensors, for fine-tuning
   """
   use Mix.Task
 
   @impl true
   def run(args) do
-    {opts, _} = OptionParser.parse!(args, strict: [speech: :boolean])
+    {opts, _} = OptionParser.parse!(args, strict: [speech: :boolean, checkpoint: :boolean])
     Application.ensure_all_started([:inets, :ssl])
 
     steps = [engine: &Cholla.Download.engine_path/0, weights: &Cholla.Download.weights_path/0]
 
     steps =
       if opts[:speech], do: steps ++ [speech: &Cholla.Download.speech_weights_path/0], else: steps
+
+    steps =
+      if opts[:checkpoint],
+        do: steps ++ [checkpoint: &Cholla.Download.checkpoint_path/0],
+        else: steps
 
     for {name, fetch} <- steps do
       case fetch.() do

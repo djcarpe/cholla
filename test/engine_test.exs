@@ -1,5 +1,5 @@
 defmodule Cholla.EngineTest do
-  # The engine is process-global, so these run serially.
+  # These share the default pool, so they run serially.
   use ExUnit.Case, async: false
   @moduletag :engine
   @moduletag timeout: 600_000
@@ -64,6 +64,13 @@ defmodule Cholla.EngineTest do
     assert Enum.all?(results, &(&1 == %{"error" => "service down"}))
   end
 
+  test "run holds calls below min_confidence" do
+    agent = Cholla.agent(tools: [control(fn _ -> flunk("must not run") end)], stateless: true)
+
+    assert {:ok, %{"held" => true, "results" => [], "function_calls" => [_]}} =
+             Cholla.run(agent, "toggle the garage door", min_confidence: 0.999)
+  end
+
   test "extract fills a schema" do
     invoice =
       Tool.new("Invoice", description: "An invoice.", params: [vendor: :string, total: :number])
@@ -122,7 +129,7 @@ defmodule Cholla.EngineTest do
     agent = Cholla.agent(tools: [control()], stateless: true)
     parent = self()
 
-    Cholla.Engine.transaction(fn ->
+    Cholla.Pool.transaction(fn ->
       task =
         Task.async(fn ->
           send(parent, :other_done)
@@ -139,7 +146,7 @@ defmodule Cholla.EngineTest do
   end
 
   test "a dead transaction owner releases the engine" do
-    {pid, ref} = spawn_monitor(fn -> Cholla.Engine.transaction(fn -> exit(:boom) end) end)
+    {pid, ref} = spawn_monitor(fn -> Cholla.Pool.transaction(fn -> exit(:boom) end) end)
     assert_receive {:DOWN, ^ref, :process, ^pid, :boom}
     assert {:ok, _} = Cholla.embed("still works")
   end
@@ -154,11 +161,17 @@ defmodule Cholla.EngineTest do
   end
 
   test "bad arguments are rejected before reaching the engine" do
-    assert_raise ArgumentError, fn -> NIF.complete("text", <<0.0::float-32-native>>, 16, 1024) end
-    assert_raise ArgumentError, fn -> NIF.complete(nil, nil, 16, 1024) end
-    assert_raise ArgumentError, fn -> NIF.complete(nil, <<1, 2, 3>>, 16, 1024) end
-    assert_raise ArgumentError, fn -> NIF.embed("a\0b", nil) end
-    assert {:error, {:already_open, _}} = NIF.open_engine("/nonexistent/libneedle.so")
+    %{instance: instance} = :sys.get_state(Cholla.Pool.engine(:default))
+    pcm = <<0.0::float-32-native>>
+
+    assert_raise ArgumentError, fn -> NIF.complete(instance, "text", pcm, 16, 1024) end
+    assert_raise ArgumentError, fn -> NIF.complete(instance, nil, nil, 16, 1024) end
+    assert_raise ArgumentError, fn -> NIF.complete(instance, nil, <<1, 2, 3>>, 16, 1024) end
+    assert_raise ArgumentError, fn -> NIF.embed(instance, "a\0b", nil) end
+    assert_raise ArgumentError, fn -> NIF.embed(make_ref(), "text", nil) end
+
+    assert {:error, "cannot read /nonexistent/libneedle.so" <> _} =
+             NIF.open_engine("/nonexistent/libneedle.so", 0, nil)
   end
 
   test "missing weights surface as an error" do

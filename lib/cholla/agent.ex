@@ -2,10 +2,10 @@ defmodule Cholla.Agent do
   @moduledoc """
   An agent configuration: system prompt, tools and options.
 
-  Agents are plain data. The engine runs one conversation at a time, owned by
-  whichever agent last used it; using a different agent re-initialises the
-  engine with that agent's prompt and tools, which discards the previous
-  agent's conversation. Build agents with `Cholla.agent/1`.
+  Agents are plain data. An engine instance runs one conversation at a time,
+  owned by whichever agent last used it; using a different agent
+  re-initialises the instance with that agent's prompt and tools, which
+  discards the previous agent's conversation. Build agents with `Cholla.agent/1`.
   """
 
   alias Cholla.Tool
@@ -15,6 +15,7 @@ defmodule Cholla.Agent do
     :id,
     :weights,
     :tool_index_path,
+    :pool,
     system: "",
     tools: [],
     tools_json: "[]",
@@ -32,6 +33,7 @@ defmodule Cholla.Agent do
           functions: %{String.t() => (map() -> term())},
           tool_index_path: String.t() | nil,
           weights: String.t() | nil,
+          pool: atom() | nil,
           stateless: boolean(),
           buffer_size: pos_integer(),
           max_new_tokens: pos_integer()
@@ -48,7 +50,10 @@ defmodule Cholla.Agent do
       Python package does, unless the prompt already has one (default `true`)
     * `:weights` - path to a fine-tuned `.cact`; the base model is used otherwise
     * `:tool_index_path` - path to a tool index for large tool sets
-    * `:stateless` - reset the conversation before every query (default `false`)
+    * `:stateless` - reset the conversation before every query (default `false`).
+      Stateless agents can run on any instance of their pool; a stateful
+      agent's conversation stays on one instance
+    * `:pool` - the `Cholla.Pool` to run on (default: the default pool)
     * `:buffer_size` - response buffer in bytes (default 256 KiB)
     * `:max_new_tokens` - default generation limit (default 512)
   """
@@ -70,10 +75,11 @@ defmodule Cholla.Agent do
       id: make_ref(),
       system: system,
       tools: schemas,
-      tools_json: JSON.encode!(schemas),
+      tools_json: Tool.encode_json(schemas),
       functions: functions,
       tool_index_path: opts[:tool_index_path] && Path.expand(opts[:tool_index_path]),
       weights: opts[:weights] && Path.expand(opts[:weights]),
+      pool: opts[:pool],
       stateless: Keyword.get(opts, :stateless, false),
       buffer_size: Keyword.get(opts, :buffer_size, 262_144),
       max_new_tokens: Keyword.get(opts, :max_new_tokens, 512)

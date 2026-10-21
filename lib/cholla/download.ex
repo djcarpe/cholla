@@ -50,6 +50,20 @@ defmodule Cholla.Download do
       fetch_file(@engine_repo, "needle3.cact", Path.join(cache_dir(), "weights"))
   end
 
+  @doc """
+  Path to the float checkpoint fine-tuning starts from
+  (`checkpoints/needle3.safetensors`, 242 MB), downloading it if needed.
+  """
+  @spec checkpoint_path() :: {:ok, Path.t()} | {:error, term()}
+  def checkpoint_path do
+    override(["CHOLLA_CHECKPOINT_PATH"], :checkpoint_path) ||
+      fetch_file(
+        @engine_repo,
+        "checkpoints/needle3.safetensors",
+        Path.join(cache_dir(), "weights")
+      )
+  end
+
   @doc "Path to the speech weights (`whistle.cact`), downloading them if needed."
   @spec speech_weights_path() :: {:ok, Path.t()} | {:error, term()}
   def speech_weights_path do
@@ -150,7 +164,7 @@ defmodule Cholla.Download do
   end
 
   defp fetch_file(repo, file, dir) do
-    target = Path.join(dir, file)
+    target = Path.join(dir, Path.basename(file))
     if File.exists?(target), do: {:ok, target}, else: download(repo, file, target)
   end
 

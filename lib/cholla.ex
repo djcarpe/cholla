@@ -31,12 +31,20 @@ defmodule Cholla do
 
   ## Conversation state
 
-  The engine holds a single conversation for the whole VM. Calls on the same
-  agent continue it until `reset/1`; a call on another agent starts a new one.
-  Build an agent with `stateless: true` to reset before every query.
+  Each engine instance holds a single conversation. Calls on the same agent
+  continue it until `reset/1`; a call on another agent that lands on the
+  same instance starts a new one. Build an agent with `stateless: true` to
+  reset before every query.
+
+  ## Pools
+
+  Calls run on a `Cholla.Pool` of engine instances: the default pool, or the
+  one named by the agent's or the call's `:pool` option. Stateless agents,
+  extraction and embeddings go to the least busy instance; a stateful agent
+  always uses the same one. See `Cholla.Pool` for sizing.
   """
 
-  alias Cholla.{Agent, Engine, NIF, Tool}
+  alias Cholla.{Agent, Engine, NIF, Pool, Tool}
 
   @type input :: String.t() | {:pcm, binary()}
   @type response :: %{String.t() => term()}
@@ -59,11 +67,11 @@ defmodule Cholla do
   """
   @spec complete(Agent.t(), input(), keyword()) :: {:ok, response()} | {:error, term()}
   def complete(%Agent{} = agent, input, opts \\ []) do
-    Engine.op(fn state ->
+    Pool.op(pool(agent, opts), affinity(agent), fn state ->
       case prepare(state, agent, input, opts) do
         {:ok, state} ->
           state = if agent.stateless, do: state, else: Engine.count_turn(state)
-          {turn(agent, input, opts), state}
+          {turn(state.instance, agent, input, opts), state}
 
         error ->
           Engine.reply(error)
@@ -75,7 +83,7 @@ defmodule Cholla do
     with {:ok, state} <- Engine.bind(state, agent),
          {:ok, state} <- prepare_audio(state, input, opts) do
       if agent.stateless do
-        :ok = NIF.reset()
+        :ok = NIF.reset(state.instance)
         {:ok, Engine.reset_turns(state)}
       else
         {:ok, state}
@@ -88,12 +96,19 @@ defmodule Cholla do
   defp prepare_audio(state, {:pcm, pcm}, opts) when is_binary(pcm) do
     with {:ok, state} <- Engine.ensure_speech(state) do
       keywords = Cholla.Speech.keywords(opts[:keywords])
-      :ok = NIF.set_audio(opts[:language], keywords, Keyword.get(opts, :word_timestamps, false))
+      word_timestamps = Keyword.get(opts, :word_timestamps, false)
+      :ok = NIF.set_audio(state.instance, opts[:language], keywords, word_timestamps)
       {:ok, state}
     end
   end
 
-  defp turn(agent, input, opts) do
+  defp pool(agent, opts), do: opts[:pool] || agent.pool || Pool.default()
+
+  # A stateful agent's conversation lives in one instance, so it always routes there.
+  defp affinity(%Agent{stateless: true}), do: nil
+  defp affinity(%Agent{id: id}), do: id
+
+  defp turn(instance, agent, input, opts) do
     max = Keyword.get(opts, :max_new_tokens, agent.max_new_tokens)
 
     {text, pcm} =
@@ -102,7 +117,7 @@ defmodule Cholla do
         text -> {text, nil}
       end
 
-    with {:ok, json} <- NIF.complete(text, pcm, max, agent.buffer_size) do
+    with {:ok, json} <- NIF.complete(instance, text, pcm, max, agent.buffer_size) do
       case JSON.decode(json) do
         {:ok, response} -> {:ok, response}
         {:error, reason} -> {:error, {:bad_envelope, reason, json}}
@@ -113,53 +128,79 @@ defmodule Cholla do
   @doc """
   Runs the full tool loop: the model picks calls, each call's tool
   `:function` runs with the arguments map, the results go back to the model,
-  and this repeats until it stops calling tools.
+  and this repeats until it stops calling tools, repeats the previous
+  round's calls exactly, or reaches `:max_steps`.
 
   Returns the final response with `"results"` holding every tool result in
   order. A tool that raises yields `%{"error" => message}` for the model to
-  see. The engine is reserved for the calling process for the whole loop, so
-  tool functions may call `Cholla` themselves.
+  see. One engine instance is reserved for the calling process for the whole
+  loop, and tool functions that call `Cholla` on the same pool run on it.
 
   ## Options
 
+    * `:pool` - the pool to run on, overriding the agent's
     * `:max_steps` - maximum tool rounds (default 8)
     * `:max_new_tokens` - per turn
     * `:strict` - refuse to run a call whose arguments the engine flags as
       ungrounded in the query, unless the value is a number written in the
       query or system prompt (default `true`)
+    * `:min_confidence` - hold a turn whose `"confidence"` is below this value
+      (or missing) instead of running its calls. The response comes back with
+      `"held" => true` and the unexecuted `"function_calls"`, so the caller can
+      ask for confirmation. Off by default
   """
   @spec run(Agent.t(), String.t(), keyword()) :: {:ok, response()} | {:error, term()}
   def run(%Agent{} = agent, query, opts \\ []) when is_binary(query) do
     max_steps = Keyword.get(opts, :max_steps, 8)
     strict = Keyword.get(opts, :strict, true)
 
-    Engine.transaction(fn ->
+    Pool.transaction(pool(agent, opts), affinity(agent), fn ->
       with {:ok, response} <- complete(agent, query, opts) do
-        loop(agent, response, query, strict, max_steps, opts, [])
+        loop(agent, response, query, strict, max_steps, opts, [], nil)
       end
     end)
   end
 
-  defp loop(agent, response, query, strict, steps, opts, executed) do
+  # `previous` holds the last round's calls: a model that repeats them exactly
+  # (typically retrying a call that failed) is making no progress, so stop.
+  defp loop(agent, response, query, strict, steps, opts, executed, previous) do
     calls = response["function_calls"] || []
 
-    if steps == 0 or response["type"] != "call" or calls == [] do
-      {:ok, Map.put(response, "results", executed)}
-    else
-      ungrounded = ungrounded_paths(response)
-      results = Enum.map(calls, &execute(agent, &1, ungrounded, query, strict))
+    cond do
+      steps == 0 or response["type"] != "call" or calls == [] or calls == previous ->
+        {:ok, Map.put(response, "results", executed)}
 
-      with {:ok, next} <- continue(agent, JSON.encode!(Enum.map(results, &jsonable/1)), opts) do
-        loop(agent, next, query, strict, steps - 1, opts, executed ++ results)
-      end
+      below_confidence?(response, opts[:min_confidence]) ->
+        {:ok, response |> Map.put("results", executed) |> Map.put("held", true)}
+
+      true ->
+        run_calls(agent, response, calls, query, strict, steps, opts, executed)
+    end
+  end
+
+  defp below_confidence?(_response, nil), do: false
+
+  defp below_confidence?(response, min) do
+    case response["confidence"] do
+      confidence when is_number(confidence) -> confidence < min
+      _ -> true
+    end
+  end
+
+  defp run_calls(agent, response, calls, query, strict, steps, opts, executed) do
+    ungrounded = ungrounded_paths(response)
+    results = Enum.map(calls, &execute(agent, &1, ungrounded, query, strict))
+
+    with {:ok, next} <- continue(agent, JSON.encode!(Enum.map(results, &jsonable/1)), opts) do
+      loop(agent, next, query, strict, steps - 1, opts, executed ++ results, calls)
     end
   end
 
   # A follow-up turn that feeds tool results back; not counted as a new query.
   defp continue(agent, text, opts) do
-    Engine.op(fn state ->
+    Pool.op(pool(agent, opts), affinity(agent), fn state ->
       case Engine.bind(state, agent) do
-        {:ok, state} -> {turn(agent, text, opts), state}
+        {:ok, state} -> {turn(state.instance, agent, text, opts), state}
         error -> Engine.reply(error)
       end
     end)
@@ -204,7 +245,7 @@ defmodule Cholla do
 
   ## Options
 
-    * `:system`, `:weights`, `:max_new_tokens`
+    * `:system`, `:weights`, `:max_new_tokens`, `:pool`
     * `:strict` - return `{:error, {:ungrounded, paths}}` when the engine
       flags values not grounded in the text, or a negated request
       (default `true`)
@@ -217,6 +258,7 @@ defmodule Cholla do
         tools: [schema],
         system: opts[:system] || "",
         weights: opts[:weights],
+        pool: opts[:pool],
         stateless: true
       )
 
@@ -256,14 +298,18 @@ defmodule Cholla do
   Embeds text with the model's embedding head.
 
   Returns a list of floats, or the raw native-endian f32 binary with
-  `format: :binary`. Pass `weights:` to embed with a fine-tuned model.
+  `format: :binary`. Pass `weights:` to embed with a fine-tuned model and
+  `pool:` to run on a pool other than the default.
   """
   @spec embed(String.t(), keyword()) :: {:ok, [float()] | binary()} | {:error, term()}
   def embed(text, opts \\ []) when is_binary(text) do
-    Engine.op(fn state ->
+    Pool.op(opts[:pool] || Pool.default(), nil, fn state ->
       case Engine.ensure_text(state, opts[:weights] && Path.expand(opts[:weights])) do
-        {:ok, state} -> {NIF.embed(text, nil) |> format_floats(opts[:format]), state}
-        error -> Engine.reply(error)
+        {:ok, state} ->
+          {NIF.embed(state.instance, text, nil) |> format_floats(opts[:format]), state}
+
+        error ->
+          Engine.reply(error)
       end
     end)
   end
@@ -273,21 +319,25 @@ defmodule Cholla do
   def format_floats({:ok, bin}, _), do: {:ok, for(<<f::float-32-native <- bin>>, do: f)}
   def format_floats(error, _), do: error
 
-  @doc "Clears the agent's conversation, if it is the one the engine holds."
+  @doc "Clears the agent's conversation, if it is the one its instance holds."
   @spec reset(Agent.t()) :: :ok | {:error, term()}
-  def reset(%Agent{id: id}) do
-    Engine.op(fn
-      %Engine{active: ^id} = state -> {NIF.reset(), Engine.reset_turns(state)}
+  def reset(%Agent{id: id} = agent) do
+    Pool.op(pool(agent, []), id, fn
+      %Engine{active: ^id} = state -> {NIF.reset(state.instance), Engine.reset_turns(state)}
       state -> {:ok, state}
     end)
   end
 
   @doc """
-  Opens the engine and loads the base model ahead of the first query.
-  Pass `speech: true` to load the Whistle speech model too.
+  Opens every instance of a pool and loads the base model ahead of the first
+  query. Pass `speech: true` to load the Whistle speech model too, and
+  `pool:` for a pool other than the default.
   """
   @spec preload(keyword()) :: :ok | {:error, term()}
-  defdelegate preload(opts \\ []), to: Engine
+  def preload(opts \\ []) do
+    models = if opts[:speech], do: [:text, :speech], else: [:text]
+    Pool.preload(opts[:pool] || Pool.default(), models)
+  end
 
   ## Grounding helpers
 

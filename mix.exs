@@ -28,6 +28,8 @@ defmodule Cholla.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.9", runtime: false},
+      {:nx, "~> 1.0"},
+      {:exla, "~> 1.0", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
