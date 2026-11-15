@@ -49,8 +49,9 @@ defmodule Cholla.Train do
   @doc """
   Trains a LoRA adapter on `examples` (a JSONL path or a list of maps) and
   writes it to `:out` (default `needle_lora.safetensors`). Returns
-  `{:ok, path, stats}` with the final training loss, validation loss and
-  the held-out examples.
+  `{:ok, path, stats}` with the final training loss, validation loss, the
+  held-out examples, the `seq_len` it trained at, the `longest` example's
+  tokens and how many examples were `left_out` as longer than the cap.
 
   ## Options
 
@@ -60,7 +61,10 @@ defmodule Cholla.Train do
     * `:epochs` (3), `:batch_size` (16), `:lr` (1.0e-4)
     * `:lora_rank` (16), `:lora_alpha` (32)
     * `:max_len` (1024) - cap on the sequence length; training uses the
-      smallest power-of-two bucket from 128 that fits the data
+      smallest power-of-two bucket from 128 that fits the data. An example
+      longer than the cap would lose its answer and train on nothing, so it
+      is left out (a progress line says how many); when none fits,
+      `{:error, reason}` before the checkpoint loads
     * `:val_split` (0.1) - fraction held out for validation, 0 to disable
     * `:seed` (0) - adapter init, split and shuffling
     * `:progress` - a function called with each progress line
@@ -74,24 +78,41 @@ defmodule Cholla.Train do
          :ok <- ensure_compiler(),
          {:ok, checkpoint_path} <- checkpoint_path(opts),
          {:ok, base} <- base_cact(opts),
-         {:ok, ckpt} <- Checkpoint.load(checkpoint_path),
-         {:ok, consts} <- Checkpoint.constants(base) do
-      run(examples, ckpt, consts, checkpoint_path, opts, emit)
+         {:ok, consts} <- Checkpoint.constants(base),
+         {:ok, fit} <- fit(consts.tokenizer, examples, opts[:max_len], emit),
+         {:ok, ckpt} <- Checkpoint.load(checkpoint_path) do
+      run(fit, ckpt, consts, checkpoint_path, opts, emit)
     end
   end
 
-  defp run(examples, ckpt, consts, checkpoint_path, opts, emit) do
+  # every example tokenised once; the ones whose answer the cap would cut are left out
+  # (their mask would be all zeros: a loss of exactly 0 that trains nothing)
+  defp fit(tok, examples, cap, emit) do
+    with {:ok, fit} <- Data.fit(tok, examples, cap) do
+      if fit.left_out > 0 do
+        emit.(
+          "  #{pad("left out")} #{fit.left_out} of #{fit.left_out + length(fit.examples)} examples " <>
+            "longer than the cap: the longest is #{fit.longest} tokens, the cap #{cap}"
+        )
+      end
+
+      emit.(
+        "  #{pad("data")} #{length(fit.examples)} examples  seq_len #{fit.seq_len}  cap #{cap}  " <>
+          "longest #{fit.longest} tokens"
+      )
+
+      {:ok, fit}
+    end
+  end
+
+  defp run(fit, ckpt, consts, checkpoint_path, opts, emit) do
     cfg = ckpt.config
-    tok = consts.tokenizer
     tc = Map.take(consts, [:cb4, :hadamard, :p1, :p2])
     emit.("  #{pad("backend")} #{backend()}  float32")
     emit.("  #{pad("depth")} #{cfg.num_layers} layers")
 
-    max_len = Data.fit_max_len(tok, examples, opts[:max_len])
-
-    emit.(
-      "  #{pad("data")} #{length(examples)} examples  seq_len #{max_len}  cap #{opts[:max_len]}"
-    )
+    max_len = fit.seq_len
+    examples = fit.examples
 
     seed = opts[:seed]
     rng = :rand.seed_s(:exsss, {seed, seed + 1, seed + 2})
@@ -100,8 +121,8 @@ defmodule Cholla.Train do
     {val, train} = Enum.split(shuffled, n_val)
     if n_val > 0, do: emit.("  #{pad("holdout")} #{n_val} examples for validation")
 
-    encode = fn ex ->
-      {ids, mask} = Data.encode(tok, ex, max_len)
+    encode = fn {_ex, tokens} ->
+      {ids, mask} = Data.encode_tokens(tokens, max_len)
       {ids, mask, Data.engram_indices(ids, cfg)}
     end
 
@@ -209,7 +230,16 @@ defmodule Cholla.Train do
     )
 
     {:ok, out,
-     %{loss: last, val_loss: val_loss, holdout: val, train: length(train), steps: total}}
+     %{
+       loss: last,
+       val_loss: val_loss,
+       holdout: Enum.map(val, &elem(&1, 0)),
+       train: length(train),
+       steps: total,
+       seq_len: max_len,
+       longest: fit.longest,
+       left_out: fit.left_out
+     }}
   end
 
   @doc """

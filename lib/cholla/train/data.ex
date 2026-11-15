@@ -120,13 +120,23 @@ defmodule Cholla.Train.Data do
   @doc """
   Tokenises an example to `max_len`: `{ids, mask}` lists, where the mask is
   1.0 on the target tokens (and the closing eos) and 0.0 on the prompt and
-  padding.
+  padding. An example longer than `max_len` loses its end — the target
+  first, so the mask can be all zeros and the example trains on nothing:
+  `fit/3` leaves such examples out before they get here.
   """
   @spec encode(Tokenizer.t(), map(), pos_integer()) :: {[integer()], [float()]}
-  def encode(tok, example, max_len) do
+  def encode(tok, example, max_len), do: tok |> tokenize(example) |> encode_tokens(max_len)
+
+  @doc "An example's `{prompt_ids, target_ids}`, without bos and eos."
+  @spec tokenize(Tokenizer.t(), map()) :: {[integer()], [integer()]}
+  def tokenize(tok, example) do
     {prompt, target} = render(example)
-    prompt_ids = Tokenizer.encode(tok, prompt)
-    target_ids = Tokenizer.encode(tok, target)
+    {Tokenizer.encode(tok, prompt), Tokenizer.encode(tok, target)}
+  end
+
+  @doc "`encode/3` from an example `tokenize/2` already tokenised."
+  @spec encode_tokens({[integer()], [integer()]}, pos_integer()) :: {[integer()], [float()]}
+  def encode_tokens({prompt_ids, target_ids}, max_len) do
     ids = [Tokenizer.bos_id()] ++ prompt_ids ++ target_ids ++ [Tokenizer.eos_id()]
 
     mask =
@@ -139,19 +149,69 @@ defmodule Cholla.Train.Data do
   end
 
   @doc "The number of tokens an example takes, with bos and eos."
-  def token_length(tok, example) do
-    {prompt, target} = render(example)
-    length(Tokenizer.encode(tok, prompt)) + length(Tokenizer.encode(tok, target)) + 2
-  end
+  def token_length(tok, example), do: tok |> tokenize(example) |> tokens_length()
+
+  defp tokens_length({prompt_ids, target_ids}), do: length(prompt_ids) + length(target_ids) + 2
 
   @doc """
   The sequence length to train at: the smallest power-of-two bucket from 128
-  that holds the longest example, capped at `cap`.
+  that holds the longest example, capped at `cap`. It says nothing of the
+  examples the cap cuts; `fit/3` leaves those out.
   """
   def fit_max_len(tok, examples, cap) do
     longest = examples |> Enum.map(&token_length(tok, &1)) |> Enum.max(fn -> 0 end)
     bucket(128, min(longest, cap)) |> min(cap)
   end
+
+  @doc """
+  The examples that train whole within `cap` tokens, and the sequence length
+  to train them at. An example longer than the cap would lose its answer
+  (`encode/3` cuts the end), leaving a mask of zeros and a loss of exactly
+  0: it is left out rather than trained on nothing.
+
+  `{:ok, fit}` with `seq_len` (the smallest power-of-two bucket from 128
+  that holds the longest example kept, at most `cap`), `examples` (the kept
+  ones, each `{example, tokens}` as `tokenize/2` returns them), `left_out`
+  (how many did not fit), `longest` (the longest example's tokens, kept or
+  not) and `cap`; `{:error, reason}` with those numbers when none fits.
+  Examples are tokenised once, concurrently.
+  """
+  @spec fit(Tokenizer.t(), [map()], pos_integer()) :: {:ok, map()} | {:error, String.t()}
+  def fit(tok, examples, cap) do
+    measured =
+      examples
+      |> Task.async_stream(fn ex -> {ex, tokenize(tok, ex)} end, timeout: :infinity)
+      |> Enum.map(fn {:ok, pair} -> pair end)
+
+    lengths = Enum.map(measured, fn {_, tokens} -> tokens_length(tokens) end)
+    longest = Enum.max(lengths, fn -> 0 end)
+    kept = for {pair, n} <- Enum.zip(measured, lengths), n <= cap, do: {pair, n}
+    left_out = length(measured) - length(kept)
+
+    case kept do
+      [] ->
+        {:error,
+         "none of the #{length(measured)} #{plural(length(measured), "example")} fits the " <>
+           "sequence cap of #{cap} tokens (shortest #{Enum.min(lengths, fn -> 0 end)}, longest " <>
+           "#{longest}): each would lose its answer and train on nothing; raise the cap " <>
+           "(max_len) or give the examples fewer or shorter tools"}
+
+      _ ->
+        kept_longest = kept |> Enum.map(&elem(&1, 1)) |> Enum.max()
+
+        {:ok,
+         %{
+           seq_len: bucket(128, kept_longest) |> min(cap),
+           examples: Enum.map(kept, &elem(&1, 0)),
+           left_out: left_out,
+           longest: longest,
+           cap: cap
+         }}
+    end
+  end
+
+  defp plural(1, word), do: word
+  defp plural(_, word), do: word <> "s"
 
   defp bucket(b, longest) when b >= longest, do: b
   defp bucket(b, longest), do: bucket(b * 2, longest)

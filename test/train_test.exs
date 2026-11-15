@@ -360,4 +360,70 @@ defmodule Cholla.TrainTest do
     assert hd(ids) == 2 and hd(mask) == 0.0
     assert Enum.at(mask, -1) == 0.0
   end
+
+  describe "Data.fit/3" do
+    # one id per character (unknown ones are unk): lengths follow the rendered text
+    defp tiny_tokenizer do
+      %Cholla.Train.Tokenizer{
+        ids: %{"a" => 10},
+        pieces: %{10 => "a"},
+        scores: %{10 => 0.0},
+        types: %{10 => 0},
+        markers: [],
+        add_dummy_prefix: false,
+        byte_fallback: false,
+        unk_id: 3
+      }
+    end
+
+    @short %{"query" => "a", "tools" => [], "answers" => []}
+
+    test "a cap shorter than the prompt cuts the whole answer: the mask trains on nothing" do
+      tok = tiny_tokenizer()
+      long = Map.put(@example, "answers", [])
+      {prompt, _} = Data.render(long)
+      prompt_len = length(Cholla.Train.Tokenizer.encode(tok, prompt))
+
+      # what every line of a 15-tool NeedleModel export did at seq_len 1024: loss exactly 0
+      {_ids, mask} = Data.encode(tok, long, prompt_len)
+      assert Enum.sum(mask) == 0.0
+    end
+
+    test "examples whose answer the cap would cut are left out; the rest train whole" do
+      tok = tiny_tokenizer()
+      short_len = Data.token_length(tok, @short)
+      long_len = Data.token_length(tok, @example)
+      assert short_len < long_len
+
+      assert {:ok, fit} = Data.fit(tok, [@short, @example, @short], long_len - 1)
+      assert fit.left_out == 1 and length(fit.examples) == 2
+      assert fit.longest == long_len and fit.cap == long_len - 1
+      assert fit.seq_len >= short_len and fit.seq_len <= long_len - 1
+
+      for {ex, tokens} <- fit.examples do
+        assert ex == @short
+        {_prompt_ids, target_ids} = tokens
+        {ids, mask} = Data.encode_tokens(tokens, fit.seq_len)
+        assert length(ids) == fit.seq_len
+        # the whole answer and the closing eos are in the mask
+        assert Enum.sum(mask) == length(target_ids) + 1.0
+        assert {ids, mask} == Data.encode(tok, ex, fit.seq_len)
+      end
+
+      # everything fits: none left out, the bucket of the longest
+      assert {:ok, all} = Data.fit(tok, [@short, @example], 4096)
+      assert all.left_out == 0 and length(all.examples) == 2
+      assert all.seq_len == Enum.find([128, 256, 512, 1024, 2048, 4096], &(&1 >= long_len))
+    end
+
+    test "none fits: an error with the count, the lengths and the cap" do
+      tok = tiny_tokenizer()
+      short_len = Data.token_length(tok, @short)
+      long_len = Data.token_length(tok, @example)
+
+      assert {:error, reason} = Data.fit(tok, [@example, @short], short_len - 1)
+      assert reason =~ "none of the 2 examples fits the sequence cap of #{short_len - 1} tokens"
+      assert reason =~ "shortest #{short_len}, longest #{long_len}"
+    end
+  end
 end
