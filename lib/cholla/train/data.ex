@@ -113,9 +113,30 @@ defmodule Cholla.Train.Data do
     {prompt, target}
   end
 
-  @doc "Compact JSON in the model's key order; see `Cholla.Tool.encode_json/1`."
+  @key_order ~w(name description parameters arguments type properties required enum items)
+
+  @doc "Compact JSON with a fixed key order; see `render/1`."
   @spec encode_json(term()) :: String.t()
-  defdelegate encode_json(term), to: Cholla.Tool
+  def encode_json(term), do: term |> ordered_iodata() |> IO.iodata_to_binary()
+
+  defp ordered_iodata(%{} = map) do
+    {first, rest} = Enum.split_with(Map.keys(map), &(&1 in @key_order))
+
+    keys =
+      Enum.sort_by(first, &Enum.find_index(@key_order, fn k -> k == &1 end)) ++ Enum.sort(rest)
+
+    pairs =
+      for key <- keys do
+        [JSON.encode!(to_string(key)), ?:, ordered_iodata(map[key])]
+      end
+
+    [?{, Enum.intersperse(pairs, ?,), ?}]
+  end
+
+  defp ordered_iodata(list) when is_list(list),
+    do: [?[, list |> Enum.map(&ordered_iodata/1) |> Enum.intersperse(?,), ?]]
+
+  defp ordered_iodata(other), do: JSON.encode!(other)
 
   @doc """
   Tokenises an example to `max_len`: `{ids, mask}` lists, where the mask is
