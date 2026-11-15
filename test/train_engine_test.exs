@@ -101,7 +101,7 @@ defmodule Cholla.TrainRunTest do
     assert map_size(lora) == 5 and meta.rank == 16 and meta.scale == 2.0
     assert Nx.shape(lora["stack/layers/block/self_attn/q_proj/kernel"].a) == {20, 768, 16}
 
-    assert {:ok, cact, %{layers: 20, tensors: 574}} =
+    assert {:ok, cact, %{layers: 20, tensors: 581}} =
              Cholla.Train.build(lora: adapter, out: Path.join(dir, "a.cact"))
 
     {:ok, archive} = Cholla.Train.Cact.read(cact)

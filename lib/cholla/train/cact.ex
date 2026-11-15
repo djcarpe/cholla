@@ -30,7 +30,7 @@ defmodule Cholla.Train.Cact do
   @raw 4
 
   @type dtype :: :fp16 | :fp32 | :cq | :raw
-  @type record :: %{
+  @type tensor_record :: %{
           dtype: dtype(),
           shape: tuple(),
           offset: non_neg_integer(),
@@ -57,8 +57,9 @@ defmodule Cholla.Train.Cact do
     [_tag, num_tensors, codebook_len | _] = fields
     header = header_map(fields)
 
-    <<cb::binary-size(codebook_len * 4), dir::binary-size(num_tensors * @record_size), _::binary>> =
-      rest
+    cb_len = codebook_len * 4
+    dir_len = num_tensors * @record_size
+    <<cb::binary-size(^cb_len), dir::binary-size(^dir_len), _::binary>> = rest
 
     codebook = for <<f::little-float-32 <- cb>>, do: f
     records = for <<rec::binary-size(@record_size) <- dir>>, do: parse_record(rec)

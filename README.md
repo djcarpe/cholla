@@ -248,23 +248,9 @@ What happens, and how it compares with `needle finetune` / `needle build`:
 Training needs the EXLA compiler: add `{:exla, "~> 1.0"}` to your deps. It
 runs on the CPU by default. Measured on a 4-core/8-thread i7-6700K, a
 batch of 16 examples at 256 tokens takes 33 s per step after a two-minute
-compile, so 100 examples for 3 epochs take about 15 minutes; `build/1`
-takes about 6 minutes and 3.5 GB. For a GPU, build EXLA with
-`XLA_TARGET=cuda12` and set `config :exla, default_client: :cuda`.
-
-The defaults are the Python trainer's and suit a few hundred examples. A
-small set needs a longer, hotter schedule: on 60 examples teaching a radio
-agent that "whisper", "normal" and "shout" are power levels, the defaults
-(12 steps, most at a near-zero learning rate) left the archive at the base
-model's 40 % exact matches, while `epochs: 10, batch_size: 8, lr: 1.0e-3`
-(70 steps, 13 minutes) reached 77 %. Validation loss is the guide: it
-should fall well below 0.1.
-
-The engine places the tools JSON in the prompt as given, and the model is
-sensitive to its key order, so `Cholla.agent/1` serialises tools in the
-order it was trained on (`Cholla.Tool.encode_json/1`): `name`,
-`description`, `parameters`. On the radio set the published base model
-scores 30/60 in that order and 7/60 with Elixir's sorted keys.
+compile, so 100 examples for 3 epochs take about 15 minutes. For a GPU,
+build EXLA with `XLA_TARGET=cuda12` and set
+`config :exla, default_client: :cuda`.
 
 ## Raw API
 
