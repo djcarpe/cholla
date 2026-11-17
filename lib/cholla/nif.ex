@@ -1,6 +1,7 @@
 defmodule Cholla.NIF do
   @moduledoc """
-  Raw bindings to the Needle C API (`needle.h`).
+  Raw bindings to the Cactus C API (`cactus.h`; Needle 3's `needle.h` has the
+  same functions without `describe/8`).
 
   Every function here maps one-to-one onto an engine call on an instance
   opened with `open_engine/3`. An instance holds one model per kind and one
@@ -21,12 +22,16 @@ defmodule Cholla.NIF do
 
   @text 1
   @speech 2
+  @vision 4
 
   @doc "Bit set in `models/0` when a text model is loaded (`NEEDLE_TEXT`)."
   def text_model, do: @text
 
   @doc "Bit set in `models/0` when a speech model is loaded (`NEEDLE_SPEECH`)."
   def speech_model, do: @speech
+
+  @doc "Bit set in `models/0` when a vision model (Mirage) is loaded (`CACTUS_VISION`)."
+  def vision_model, do: @vision
 
   @doc false
   def load_nif do
@@ -105,4 +110,23 @@ defmodule Cholla.NIF do
   @doc "`needle_embed`: exactly one of `text` and `pcm` is non-nil. Returns native f32 floats."
   @spec embed(instance(), iodata() | nil, binary() | nil) :: {:ok, binary()} | {:error, term()}
   def embed(_instance, _text, _pcm), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  `cactus_describe` (Cactus 4 only): one Mirage pass over packed 8-bit RGB
+  pixels (`width * height * 3` bytes, row-major) with `options` as a JSON
+  object (`sections`, `fields`, `conf`, `mask_format`, `form`, …). Returns the
+  JSON result; a too-small buffer is retried once at the size asked for.
+  """
+  @spec describe(
+          instance(),
+          binary(),
+          pos_integer(),
+          pos_integer(),
+          iodata(),
+          iodata() | nil,
+          iodata() | nil,
+          pos_integer()
+        ) :: {:ok, binary()} | {:error, term()}
+  def describe(_instance, _rgb, _width, _height, _options, _language, _keywords, _capacity),
+    do: :erlang.nif_error(:nif_not_loaded)
 end

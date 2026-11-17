@@ -17,12 +17,15 @@ defmodule Cholla.Pool do
       config :cholla,
         pools: [
           default: [size: 3, threads: 2, preload: [:text]],
-          speech: [size: 1, threads: 2, preload: [:speech]]
+          speech: [size: 1, threads: 2, preload: [:speech]],
+          vision: [size: 1, threads: 2]
         ],
-        speech_pool: :speech
+        speech_pool: :speech,
+        vision_pool: :vision
 
   `Cholla` calls use `:default` (or `config :cholla, default_pool: name`),
-  `Cholla.Speech` calls use `config :cholla, speech_pool: name`, falling back
+  `Cholla.Speech` calls use `config :cholla, speech_pool: name` and
+  `Cholla.Vision` calls `config :cholla, vision_pool: name`, each falling back
   to the default pool, and either can be overridden per call or per agent
   with `pool: name`. Pools can also be started in your own supervision tree
   with `{Cholla.Pool, name: :mine, size: 2}`.
@@ -36,7 +39,8 @@ defmodule Cholla.Pool do
       otherwise
     * `:cpus` - a list with one list of CPU numbers per instance; each
       instance then runs only on its CPUs
-    * `:preload` - models to load at start, `[:text]` and/or `[:speech]`;
+    * `:preload` - models to load at start, `[:text]`, `[:speech]` and/or
+      `[:vision]` (Mirage, Cactus 4);
       loading is otherwise deferred to first use
 
   ## Threads
@@ -127,6 +131,9 @@ defmodule Cholla.Pool do
   @doc false
   def speech_default, do: Application.get_env(:cholla, :speech_pool, default())
 
+  @doc false
+  def vision_default, do: Application.get_env(:cholla, :vision_pool, default())
+
   @doc """
   Picks the engine for a call. With a `key`, the same key always gets the
   same engine; with `nil`, the engine with the least work queued. Inside a
@@ -206,8 +213,8 @@ defmodule Cholla.Pool do
     end
   end
 
-  @doc "Loads `models` (`:text`, `:speech`) into every engine of the pool."
-  @spec preload(atom(), [:text | :speech]) :: :ok | {:error, term()}
+  @doc "Loads `models` (`:text`, `:speech`, `:vision`) into every engine of the pool."
+  @spec preload(atom(), [:text | :speech | :vision]) :: :ok | {:error, term()}
   def preload(pool \\ default(), models \\ [:text]) do
     {size, _load} = config(pool)
 

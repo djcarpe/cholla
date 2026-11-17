@@ -28,6 +28,7 @@ defmodule Cholla.Engine do
             load: nil,
             text_weights: nil,
             speech_loaded: false,
+            vision_loaded: false,
             active: nil,
             turns: 0,
             warned: false,
@@ -83,6 +84,8 @@ defmodule Cholla.Engine do
 
   @doc false
   def ensure_open(%__MODULE__{instance: nil} = state) do
+    no_telemetry()
+
     with {:ok, path} <- Download.engine_path(),
          {:ok, instance} <- NIF.open_engine(path, state.threads || 0, state.cpus) do
       warn_oversubscribed(NIF.info(instance))
@@ -93,6 +96,16 @@ defmodule Cholla.Engine do
   end
 
   def ensure_open(state), do: {:ok, state}
+
+  # The engine library holds no telemetry; Cactus's Python package does, and
+  # honours these. Set them anyway, so nothing loaded in this VM reports.
+  defp no_telemetry do
+    for {key, value} <- [{"CACTUS_TELEMETRY", "0"}, {"DO_NOT_TRACK", "1"}],
+        System.get_env(key) != value,
+        do: System.put_env(key, value)
+
+    :ok
+  end
 
   defp warn_oversubscribed(%{vm_threads: total, instances: instances}) do
     cores = System.schedulers_online()
@@ -146,6 +159,23 @@ defmodule Cholla.Engine do
     end
   end
 
+  @doc false
+  def ensure_vision(%__MODULE__{vision_loaded: true} = state), do: {:ok, state}
+
+  def ensure_vision(state) do
+    with {:ok, state} <- ensure_open(state) do
+      with {:ok, path} <- Download.vision_weights_path(),
+           {:ok, data} <- File.read(path),
+           {:ok, models} <- NIF.load(state.instance, data) do
+        if Bitwise.band(models, NIF.vision_model()) != 0,
+          do: {:ok, %{state | vision_loaded: true}},
+          else: {:error, {:load_failed, path, "archive holds no vision model"}, state}
+      else
+        {:error, reason} -> {:error, {:vision_unavailable, reason}, state}
+      end
+    end
+  end
+
   defp load_models(state, models) do
     Enum.reduce_while(models, {:ok, state}, fn model, {:ok, state} ->
       case load_model(state, model) do
@@ -157,6 +187,7 @@ defmodule Cholla.Engine do
 
   defp load_model(state, :text), do: ensure_text(state, nil)
   defp load_model(state, :speech), do: ensure_speech(state)
+  defp load_model(state, :vision), do: ensure_vision(state)
 
   @doc false
   def bind(state, agent) do

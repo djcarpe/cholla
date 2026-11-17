@@ -1,8 +1,12 @@
 /*
- * cholla_nif.c - Erlang NIF bindings to the Cactus Compute Needle engine.
+ * cholla_nif.c - Erlang NIF bindings to the Cactus Compute engine.
  *
- * The engine (libneedle) is a prebuilt, self-contained shared library that
- * keeps one process-global, non-thread-safe model per kind (text, speech)
+ * The engine is a prebuilt, self-contained shared library: Cactus 4's
+ * libcactus (cactus_* symbols, cactus.h), or the older Needle 3 libneedle3
+ * (needle_* symbols, needle.h), which has the same functions without
+ * cactus_set_threads and cactus_describe. Either loads; a function the
+ * library lacks answers {error, ...}. The engine
+ * keeps one process-global, non-thread-safe model per kind (text, speech, vision)
  * and a pool of worker threads sized to every online CPU. To run several
  * engines in one VM, each instance dlopens a private copy of the library
  * (an anonymous memfd on Linux, else an unlinked temp file), so every copy
@@ -45,7 +49,7 @@
 
 #include <erl_nif.h>
 
-#include "needle.h"
+#include "cactus.h"
 
 typedef int (*load_fn)(const unsigned char *, unsigned long long);
 typedef int (*models_fn)(void);
@@ -58,6 +62,8 @@ typedef int (*transcribe_fn)(const float *, int, const char *, const char *, int
 typedef int (*stream_process_fn)(const float *, int, const char *, const char *, char *, int);
 typedef int (*stream_stop_fn)(char *, int);
 typedef int (*embed_fn)(const char *, const float *, int, float *, int);
+typedef void (*set_threads_fn)(int);
+typedef int (*describe_fn)(const unsigned char *, int, int, const char *, const char *, const char *, char *, int);
 
 typedef struct {
     ErlNifMutex *lock;
@@ -80,6 +86,9 @@ typedef struct {
     stream_process_fn stream_process;
     stream_stop_fn stream_stop;
     embed_fn embed;
+    set_threads_fn set_threads; /* Cactus 4 only */
+    describe_fn describe;       /* Cactus 4 only */
+    int cactus;                 /* 1 for the cactus_* ABI, 0 for needle_* */
 } instance_t;
 
 static ErlNifResourceType *instance_type;
@@ -90,7 +99,8 @@ static int open_instances;
 static int total_threads;
 
 static ERL_NIF_TERM atom_ok, atom_error, atom_nil, atom_true, atom_false, atom_buffer_too_small,
-    atom_path, atom_threads, atom_cpus, atom_thread_control, atom_vm_threads, atom_instances;
+    atom_path, atom_threads, atom_cpus, atom_thread_control, atom_vm_threads, atom_instances, atom_abi,
+    atom_cactus, atom_needle;
 
 /* Engine outputs larger than this are treated as an engine fault. */
 #define MAX_OUTPUT (64 * 1024 * 1024)
@@ -330,7 +340,7 @@ static int private_copy(const char *path, char *out, size_t out_size, int *fd, c
     *fd = -1;
     int temp = 0;
 #ifdef __linux__
-    *fd = (int)syscall(SYS_memfd_create, "libneedle", 0);
+    *fd = (int)syscall(SYS_memfd_create, "libcactus", 0);
     if (*fd >= 0) snprintf(out, out_size, "/proc/self/fd/%d", *fd);
 #endif
     if (*fd < 0) {
@@ -428,25 +438,37 @@ static ERL_NIF_TERM nif_open_engine(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     in->lock = enif_mutex_create("cholla_instance");
 
     const char *missing = NULL;
-#define RESOLVE(field, name)                                \
-    do {                                                    \
-        *(void **)(&in->field) = dlsym(handle, name);       \
-        if (!in->field && !missing) missing = name;         \
+    /* Cactus 4 names its functions cactus_*, Needle 3 needle_*: the prefix of
+       cactus_load decides, and every other function must carry the same one. */
+    in->cactus = dlsym(handle, "cactus_load") != NULL;
+    const char *prefix = in->cactus ? "cactus_" : "needle_";
+    char symbol[64];
+#define RESOLVE(field, name)                                                  \
+    do {                                                                      \
+        snprintf(symbol, sizeof symbol, "%s%s", prefix, name);                \
+        *(void **)(&in->field) = dlsym(handle, symbol);                       \
+        if (!in->field && !missing) {                                         \
+            snprintf(err, sizeof err, "%s is not a Cactus 4 or Needle 3 engine: missing symbol %s", \
+                     path, symbol);                                           \
+            missing = err;                                                    \
+        }                                                                     \
     } while (0)
-    RESOLVE(load, "needle_load");
-    RESOLVE(models, "needle_models");
-    RESOLVE(last_error, "needle_last_error");
-    RESOLVE(init, "needle_init");
-    RESOLVE(complete, "needle_complete");
-    RESOLVE(set_audio, "needle_set_audio");
-    RESOLVE(reset, "needle_reset");
-    RESOLVE(transcribe, "needle_transcribe");
-    RESOLVE(stream_process, "needle_stream_transcribe_process");
-    RESOLVE(stream_stop, "needle_stream_transcribe_stop");
-    RESOLVE(embed, "needle_embed");
+    RESOLVE(load, "load");
+    RESOLVE(models, "models");
+    RESOLVE(last_error, "last_error");
+    RESOLVE(init, "init");
+    RESOLVE(complete, "complete");
+    RESOLVE(set_audio, "set_audio");
+    RESOLVE(reset, "reset");
+    RESOLVE(transcribe, "transcribe");
+    RESOLVE(stream_process, "stream_transcribe_process");
+    RESOLVE(stream_stop, "stream_transcribe_stop");
+    RESOLVE(embed, "embed");
 #undef RESOLVE
-
-    if (missing) snprintf(err, sizeof err, "%s is not a Needle 3 engine: missing symbol %s", path, missing);
+    if (in->cactus) {
+        *(void **)(&in->set_threads) = dlsym(handle, "cactus_set_threads");
+        *(void **)(&in->describe) = dlsym(handle, "cactus_describe");
+    }
 
 #if THREAD_CONTROL
     if (!missing && (threads > 0 || has_cpus) &&
@@ -465,6 +487,13 @@ static ERL_NIF_TERM nif_open_engine(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         in->handle = NULL;
         result = error_str(env, err);
     } else {
+        /* Cactus 4 sizes its pool from cactus_set_threads as well; the sysconf
+           redirect above still answers for code that asks the system. */
+        if (in->set_threads && in->threads > 0) {
+            current_threads = in->threads;
+            in->set_threads(in->threads);
+            current_threads = 0;
+        }
         /* The handle (and memfd) live for the rest of the VM: the engine's worker
            threads cannot be stopped, so the library is never unloaded. */
         in->counted = in->threads > 0 ? in->threads : (int)sysconf(_SC_NPROCESSORS_ONLN);
@@ -507,7 +536,8 @@ static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     int vm_threads = total_threads, instances = open_instances;
     enif_mutex_unlock(global_lock);
 
-    ERL_NIF_TERM keys[] = {atom_path, atom_threads, atom_cpus, atom_thread_control, atom_vm_threads, atom_instances};
+    ERL_NIF_TERM keys[] = {atom_path, atom_threads, atom_cpus, atom_thread_control, atom_vm_threads, atom_instances,
+                           atom_abi};
     ERL_NIF_TERM values[] = {
         make_binary(env, in->path, strlen(in->path)),
         in->threads > 0 ? enif_make_int(env, in->threads) : atom_nil,
@@ -515,9 +545,10 @@ static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         THREAD_CONTROL ? atom_true : atom_false,
         enif_make_int(env, vm_threads),
         enif_make_int(env, instances),
+        in->cactus ? atom_cactus : atom_needle,
     };
     ERL_NIF_TERM map;
-    enif_make_map_from_arrays(env, keys, values, 6, &map);
+    enif_make_map_from_arrays(env, keys, values, 7, &map);
     return map;
 }
 
@@ -534,7 +565,7 @@ static ERL_NIF_TERM nif_load(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     enter(in, &scope);
     /* The engine copies the archive, so the binary need not outlive the call. */
     int rc = in->load(cact.data, (unsigned long long)cact.size);
-    ERL_NIF_TERM result = rc < 0 ? engine_error(env, in, "needle_load", rc) : ok(env, enif_make_int(env, in->models()));
+    ERL_NIF_TERM result = rc < 0 ? engine_error(env, in, "load", rc) : ok(env, enif_make_int(env, in->models()));
     leave(in, &scope);
     return result;
 }
@@ -759,6 +790,59 @@ static ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
 }
 
 /* ------------------------------------------------------------------------ */
+/* describe(Instance, Rgb, Width, Height, OptionsJson, Language | nil, Keywords | nil, Capacity)
+     -> {ok, Json} | {error, R}
+   Mirage (Cactus 4): one pass over packed 8-bit RGB pixels, row-major,
+   Width * Height * 3 bytes. Stateless, so a too-small buffer is retried once
+   at the size the engine asks for. */
+
+static ERL_NIF_TERM nif_describe(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    instance_t *in;
+    ErlNifBinary rgb;
+    int width, height, capacity;
+    char *options = NULL, *language = NULL, *keywords = NULL;
+    if (!get_instance(env, argv[0], &in) || !enif_inspect_binary(env, argv[1], &rgb) ||
+        !enif_get_int(env, argv[2], &width) || !enif_get_int(env, argv[3], &height) ||
+        width <= 0 || height <= 0 || width > 65535 || height > 65535 ||
+        (unsigned long long)width * (unsigned long long)height * 3ULL != (unsigned long long)rgb.size ||
+        !get_capacity(env, argv[7], &capacity))
+        return enif_make_badarg(env);
+    if (!get_cstring(env, argv[4], 0, &options) || !get_cstring(env, argv[5], 1, &language) ||
+        !get_cstring(env, argv[6], 1, &keywords)) {
+        free_cstring(options); free_cstring(language); free_cstring(keywords);
+        return enif_make_badarg(env);
+    }
+    if (!in->describe) {
+        free_cstring(options); free_cstring(language); free_cstring(keywords);
+        return error_str(env, "this engine has no cactus_describe: vision needs the Cactus 4 library");
+    }
+
+    ERL_NIF_TERM result;
+    char *out = NULL;
+    call_scope scope;
+    enter(in, &scope);
+    int rc = -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        enif_free(out);
+        out = enif_alloc(capacity);
+        if (!out) break;
+        out[0] = '\0';
+        rc = in->describe(rgb.data, width, height, options, language, keywords, out, capacity);
+        if (rc >= 0) break;
+        int needed = needed_bytes(in);
+        if (!needed || needed <= capacity) break;
+        capacity = needed;
+    }
+    if (!out) result = error_str(env, "out of memory");
+    else if (rc < 0) result = engine_error(env, in, "cactus_describe", rc);
+    else result = ok(env, make_binary(env, out, strnlen(out, capacity)));
+    leave(in, &scope);
+    enif_free(out);
+    free_cstring(options); free_cstring(language); free_cstring(keywords);
+    return result;
+}
+
+/* ------------------------------------------------------------------------ */
 
 static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     instance_type = enif_open_resource_type(env, NULL, "cholla_instance", instance_dtor,
@@ -777,6 +861,9 @@ static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     atom_thread_control = enif_make_atom(env, "thread_control");
     atom_vm_threads = enif_make_atom(env, "vm_threads");
     atom_instances = enif_make_atom(env, "instances");
+    atom_abi = enif_make_atom(env, "abi");
+    atom_cactus = enif_make_atom(env, "cactus");
+    atom_needle = enif_make_atom(env, "needle");
     return 0;
 }
 
@@ -795,6 +882,7 @@ static ErlNifFunc funcs[] = {
     {"stream_process", 5, nif_stream_process, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"stream_stop", 2, nif_stream_stop, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"embed", 3, nif_embed, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"describe", 8, nif_describe, ERL_NIF_DIRTY_JOB_CPU_BOUND},
 };
 
 ERL_NIF_INIT(Elixir.Cholla.NIF, funcs, on_load, NULL, NULL, NULL)
