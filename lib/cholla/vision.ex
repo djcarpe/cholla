@@ -107,8 +107,42 @@ defmodule Cholla.Vision do
   defp encode(options) when is_binary(options), do: {:ok, options}
   defp encode(other), do: {:error, {:bad_options, other}}
 
-  defp decode({:ok, json}), do: JSON.decode(json)
+  defp decode({:ok, json}), do: json |> finite() |> JSON.decode()
   defp decode(error), do: error
+
+  @non_finite ["-Infinity", "Infinity", "-nan", "-NaN", "-inf", "nan", "NaN", "inf"]
+
+  @doc """
+  The engine prints a score it could not compute as `nan` or `-nan` (and could
+  print `inf`), which is not JSON. Outside strings, those become `null`.
+  """
+  def finite(json) when is_binary(json), do: finite(json, false, false, [])
+
+  defp finite(<<>>, _in_str, _esc, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp finite(<<c, rest::binary>>, true, esc, acc) do
+    case {esc, c} do
+      {true, _} -> finite(rest, true, false, [c | acc])
+      {false, ?\\} -> finite(rest, true, true, [c | acc])
+      {false, ?"} -> finite(rest, false, false, [c | acc])
+      _ -> finite(rest, true, false, [c | acc])
+    end
+  end
+
+  defp finite(<<?", rest::binary>>, false, _, acc), do: finite(rest, true, false, [?" | acc])
+
+  defp finite(bin, false, _, acc) do
+    case Enum.find(@non_finite, &String.starts_with?(bin, &1)) do
+      nil ->
+        <<c, rest::binary>> = bin
+        finite(rest, false, false, [c | acc])
+
+      t ->
+        finite(binary_part(bin, byte_size(t), byte_size(bin) - byte_size(t)), false, false, [
+          "null" | acc
+        ])
+    end
+  end
 
   defp vision_pool(opts), do: opts[:pool] || Pool.vision_default()
 end
