@@ -3,11 +3,13 @@
 Elixir bindings to [Needle](https://cactuscompute.com/needle), Cactus Compute's
 small on-device model for tool calling, structured extraction and embeddings.
 They also cover Whistle, the companion speech model, for transcription and
-spoken queries.
+spoken queries, and [Mirage](https://cactuscompute.com/blog/mirage), the vision
+model, for scene descriptions, objects, OCR text, relations and forms.
 
-Cholla is a NIF over the engine's C API (`needle.h`). The engine library and
-weights are downloaded from Hugging Face on first use and cached, just as the
-`cactus-needle` Python package does.
+Cholla is a NIF over the Cactus 4 engine's C API (`cactus.h`; the Needle 3
+library with the same functions under `needle_*` still loads, without vision).
+The engine library and weights are downloaded from Hugging Face on first use
+and cached, just as the `cactus-compute` Python package does.
 
 ## Installation
 
@@ -171,20 +173,41 @@ at size 1.
 
 Inference runs on dirty CPU schedulers.
 
+## Vision (Mirage)
+
+```elixir
+# packed 8-bit RGB, width * height * 3 bytes, from any image decoder
+{:ok, result} = Cholla.Vision.describe(rgb, width, height)
+result["scene"]     # %{"setting" => "farm", "style" => "flat illustration", ...}
+result["objects"]   # [%{"id" => 1, "name" => "barn", "bbox" => [x0, y0, x1, y1], "mask" => [...], ...}]
+result["text"]      # [%{"string" => "Flow: 42.5 m3/h", "bbox" => [...], "score" => 0.97}]
+result["relations"] # [%{"subject" => 2, "predicate" => "on", "object" => 1}]
+
+{:ok, %{"form" => %{"valve" => %{"value" => "open"}}}} =
+  Cholla.Vision.extract(rgb, width, height, %{"valve" => %{"enum" => ["open", "closed"]}})
+```
+
+Boxes and masks are on a 0–1000 scale of the image. `options:` narrows the
+pass (`%{"sections" => ["text"]}`, `"mask_format" => "polygons"`). A pass takes
+seconds on a server CPU (74 ms on a phone NPU), so give vision its own pool
+(`config :cholla, vision_pool:`). Set `CACTUS_TELEMETRY=0`: Cholla sets it, and
+`DO_NOT_TRACK=1`, before it opens an engine (the library itself sends nothing).
+
 ## Configuration
 
 ```elixir
 config :cholla,
-  engine_path: "/opt/needle/libneedle.so",     # skip the engine download
+  engine_path: "/opt/cactus/libcactus.so",     # skip the engine download
   weights_path: "/opt/needle/needle3.cact",    # base text model
   speech_weights_path: "/opt/needle/whistle.cact",
+  vision_weights_path: "/opt/needle/mirage.cact",
   cache_dir: "/var/cache/cholla",
-  engine_version: "3.3.3"
+  engine_version: "4.1.1"                      # "3.3.3": Needle 3's libneedle3, no vision
 ```
 
 The environment variables `CHOLLA_ENGINE_PATH` (or `NEEDLE3_LIB_PATH`),
-`CHOLLA_WEIGHTS_PATH`, `CHOLLA_SPEECH_WEIGHTS_PATH` and
-`CHOLLA_CHECKPOINT_PATH` take precedence. For a fine-tuned `.cact`, pass
+`CHOLLA_WEIGHTS_PATH`, `CHOLLA_SPEECH_WEIGHTS_PATH`, `CHOLLA_VISION_WEIGHTS_PATH`
+and `CHOLLA_CHECKPOINT_PATH` take precedence. For a fine-tuned `.cact`, pass
 `weights: path` to `Cholla.agent/1`.
 
 ## Fine-tuning

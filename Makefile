@@ -1,5 +1,5 @@
-# Builds the Cholla NIF. The Needle engine is not linked here: the NIF dlopens
-# the prebuilt, self-contained libneedle at runtime (see Cholla.Engine).
+# Builds the Cholla NIF. The Cactus engine is not linked here: the NIF dlopens
+# the prebuilt, self-contained libcactus (or libneedle3) at runtime (see Cholla.Engine).
 PRIV_DIR = $(MIX_APP_PATH)/priv
 NIF = $(PRIV_DIR)/cholla_nif.so
 
@@ -18,7 +18,7 @@ endif
 
 all: $(NIF)
 
-$(NIF): c_src/cholla_nif.c c_src/needle.h
+$(NIF): c_src/cholla_nif.c c_src/cactus.h
 	@mkdir -p $(PRIV_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ c_src/cholla_nif.c $(LDLIBS)
 

@@ -1,20 +1,25 @@
 defmodule Cholla.Download do
   @moduledoc """
-  Fetches and caches the Needle engine and weights from Hugging Face.
+  Fetches and caches the Cactus engine and weights from Hugging Face.
 
-  The engine is the self-contained `libneedle3` shared library published in
-  the `cactus-needle` Python wheels for each platform. Weights are the base
-  `needle3.cact` text model and the optional `whistle.cact` speech model.
+  The engine is the self-contained `libcactus` shared library of Cactus 4,
+  published in the `cactus_runtime` Python wheels of `Cactus-Compute/cactus`
+  for each platform (`engine_version: "3.3.3"` still fetches the older
+  `libneedle3` of the `cactus-needle` wheels). Weights are the base
+  `needle3.cact` text model, the optional `whistle.cact` speech model and
+  the optional `mirage.cact` vision model (Cactus 4 only).
 
   Everything is cached under `cache_dir/0`. Each path can be overridden:
 
       config :cholla,
         engine_path: "/opt/needle/libneedle.so",
         weights_path: "/opt/needle/needle3.cact",
-        speech_weights_path: "/opt/needle/whistle.cact"
+        speech_weights_path: "/opt/needle/whistle.cact",
+        vision_weights_path: "/opt/needle/mirage.cact"
 
   The environment variables `CHOLLA_ENGINE_PATH` (or `NEEDLE3_LIB_PATH`),
-  `CHOLLA_WEIGHTS_PATH` and `CHOLLA_SPEECH_WEIGHTS_PATH` take precedence over
+  `CHOLLA_WEIGHTS_PATH`, `CHOLLA_SPEECH_WEIGHTS_PATH` and
+  `CHOLLA_VISION_WEIGHTS_PATH` take precedence over
   the application config.
   """
 
@@ -23,7 +28,9 @@ defmodule Cholla.Download do
   @hub "https://huggingface.co"
   @engine_repo "Cactus-Compute/needle3"
   @speech_repo "Cactus-Compute/whistle"
-  @default_engine_version "3.3.3"
+  @vision_repo "Cactus-Compute/mirage"
+  @cactus_repo "Cactus-Compute/cactus"
+  @default_engine_version "4.1.1"
 
   @doc "The engine release to download (`config :cholla, engine_version: ...`)."
   def engine_version, do: Application.get_env(:cholla, :engine_version, @default_engine_version)
@@ -71,6 +78,13 @@ defmodule Cholla.Download do
       fetch_file(@speech_repo, "whistle.cact", Path.join(cache_dir(), "weights"))
   end
 
+  @doc "Path to the vision weights (`mirage.cact`), downloading them if needed."
+  @spec vision_weights_path() :: {:ok, Path.t()} | {:error, term()}
+  def vision_weights_path do
+    override(["CHOLLA_VISION_WEIGHTS_PATH"], :vision_weights_path) ||
+      fetch_file(@vision_repo, "mirage.cact", Path.join(cache_dir(), "weights"))
+  end
+
   defp override(envs, key) do
     case Enum.find_value(envs, &System.get_env/1) || Application.get_env(:cholla, key) do
       nil ->
@@ -98,8 +112,7 @@ defmodule Cholla.Download do
 
     case {:os.type(), machine} do
       {_, nil} ->
-        {:error,
-         "no Needle engine is published for #{arch}; build libneedle and set CHOLLA_ENGINE_PATH"}
+        {:error, "no Cactus engine library is published for #{arch}; set CHOLLA_ENGINE_PATH"}
 
       {{:unix, :darwin}, "aarch64"} ->
         {:ok, "macosx_11_0_arm64"}
@@ -123,25 +136,39 @@ defmodule Cholla.Download do
          Path.wildcard("/usr/lib/libc.so.6") == [])
   end
 
-  defp lib_member(tag) do
-    if String.starts_with?(tag, "macosx"),
-      do: "needle/libneedle3.dylib",
-      else: "needle/libneedle3.so"
+  # Needle 3's engine is libneedle3 in the cactus-needle wheels of
+  # Cactus-Compute/needle3; Cactus 4's is libcactus in the cactus_runtime
+  # wheels of Cactus-Compute/cactus.
+  defp needle3?(version), do: String.starts_with?(version, "3.")
+
+  defp lib_member(version, tag) do
+    {dir, name} =
+      if needle3?(version), do: {"needle", "libneedle3"}, else: {"cactus", "libcactus"}
+
+    ext = if String.starts_with?(tag, "macosx"), do: ".dylib", else: ".so"
+    "#{dir}/#{name}#{ext}"
+  end
+
+  defp wheel(version, tag) do
+    if needle3?(version),
+      do: {@engine_repo, "python/cactus_needle-#{version}-py3-none-#{tag}.whl"},
+      else:
+        {@cactus_repo, "releases/#{version}/python/cactus_runtime-#{version}-py3-none-#{tag}.whl"}
   end
 
   defp fetch_engine do
     with {:ok, tag} <- platform_tag() do
       version = engine_version()
-      member = lib_member(tag)
+      member = lib_member(version, tag)
       dir = Path.join([cache_dir(), "engine", version, tag])
       target = Path.join(dir, Path.basename(member))
 
       if File.exists?(target) do
         {:ok, target}
       else
-        wheel = "python/cactus_needle-#{version}-py3-none-#{tag}.whl"
+        {repo, wheel} = wheel(version, tag)
 
-        with {:ok, wheel_path} <- download(@engine_repo, wheel, Path.join(dir, "engine.whl")),
+        with {:ok, wheel_path} <- download(repo, wheel, Path.join(dir, "engine.whl")),
              {:ok, data} <- unzip_member(wheel_path, member),
              :ok <- File.mkdir_p(dir),
              :ok <- atomic_write(target, data) do
